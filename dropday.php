@@ -36,16 +36,26 @@ class Dropday extends Module
     protected $api_uri = 'https://dropday.io/api/v1/';
 
     /**
+     * @var string API key
+     */
+    protected $apiKey = null;
+
+    /**
+     * @var string Account ID
+     */
+    protected $accountId = null;
+
+    /**
      * Dropday constructor.
      */
     public function __construct()
     {
         $this->name = 'dropday';
         $this->tab = 'shipping_logistics';
-        $this->version = '1.5.0';
+        $this->version = '1.6.3';
         $this->author = 'Dropday support@dropday.nl';
         $this->need_instance = 0;
-        $this->module_key = '11652b14d72adae8e5c3d8129167bde7';
+        $this->module_key = '103f6d164a3687e35039203258788760';
 
         $this->bootstrap = true;
 
@@ -96,6 +106,50 @@ class Dropday extends Module
     public function getApiUrl($type = '')
     {
         return $type ? trim($this->api_uri, '/') . '/' . $type : trim($this->api_uri, '/');
+    }
+
+    /**
+     * Get API Key (in-memory override or configuration)
+     * 
+     * @return string
+     */
+    protected function getApiKey()
+    {
+        return $this->apiKey !== null 
+            ? $this->apiKey 
+            : Configuration::get('DROPDAY_ACCOUNT_APIKEY');
+    }
+
+    /**
+     * Get Account ID (in-memory override or configuration)
+     * 
+     * @return string
+     */
+    protected function getAccountId()
+    {
+        return $this->accountId !== null 
+            ? $this->accountId 
+            : Configuration::get('DROPDAY_ACCOUNT_ID');
+    }
+
+    /**
+     * Set API Key (in-memory, does not persist to database)
+     * 
+     * @param string $apiKey
+     */
+    protected function setApiKey($apiKey)
+    {
+        $this->apiKey = $apiKey;
+    }
+
+    /**
+     * Set Account ID (in-memory, does not persist to database)
+     * 
+     * @param string $accountId
+     */
+    protected function setAccountId($accountId)
+    {
+        $this->accountId = $accountId;
     }
 
     /**
@@ -306,8 +360,8 @@ class Dropday extends Module
         $headers = array(
             'Content-Type: application/json',
             'Accept: application/json',
-            'Api-Key: '.Configuration::get('DROPDAY_ACCOUNT_APIKEY'),
-            'Account-Id: '.Configuration::get('DROPDAY_ACCOUNT_ID')
+            'Api-Key: ' . $this->getApiKey(),
+            'Account-Id: ' . $this->getAccountId()
         );
 
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
@@ -370,11 +424,14 @@ class Dropday extends Module
         $shop = new Shop((int) $order->id_shop);
         $customer = new Customer((int) $order->id_customer);
         $address = new Address((int) $order->id_address_delivery);
+        $shippingInfo = $this->getShippingInfo($order, $cart);
+
         $orderData = [
             'external_id' => $order->reference,
             'source' => $shop->name,
             'total' => (float) $order->getOrdersTotalPaid(),
             'shipping_cost' => (float) $shipping_cost,
+            'shipping' => $shippingInfo,
             'email' => $customer->email,
             'shipping_address' => [
                 'first_name' => $address->firstname,
@@ -399,6 +456,7 @@ class Dropday extends Module
         }
         
         $products = $order->getProducts();
+        $customizationsByKey = $this->getCartCustomizations($cart, $order->id_lang);
 
         foreach ($products as $product) {
             
@@ -425,88 +483,90 @@ class Dropday extends Module
                 ? $this->context->link->getImageLink($link_rewrite, $product['image']->id, $this->imageTypeGetFormattedName('large'))
                 : null;
 
-            if ($productCustomizations = $cart->getProductCustomization($product['product_id'])) {
-                $custom = [];
+            $product_data = [
+                'external_id' => (int) $product['product_id'],
+                'name' => (string) $product['product_name'],
+                'reference' => (string) $this->getProductReference($product),
+                'quantity' => (int) $product['product_quantity'],
+                'price' => (float) $product['product_price'],
+                'purchase_price' => isset($product['original_wholesale_price']) && $product['original_wholesale_price'] > 0 ? 
+                    (float) $product['original_wholesale_price'] : (float) $product['wholesale_price'],
+                'image_url' => $image_url,
+                'brand' => (string) Manufacturer::getNameById((int) $product['id_manufacturer']),
+                'category' => (string) $cat->name,
+                'supplier' => (string) Supplier::getNameById((int) $product['id_supplier']),
+            ];
 
-                $count = 1;
-                foreach ($productCustomizations as $key => $productCustomization) {
-                    $productCustomizationName = $this->getProductCustomizationFieldName($productCustomization);
-
-                    $productCustomizationValue = $this->getProductCustomizationFieldValue($productCustomization);
-
-                    if ($productCustomizationValue === false) {
-                        continue;
-                    }
-
-                    if (!$productCustomizationName) {
-                        $productCustomizationName = 'value_' . (string) $count;
-                    }
-
-                    $custom[$productCustomization['id_customization']][$productCustomizationName] = $productCustomizationValue;
-
-                    $count++;
-                }
-
-                foreach ($custom as $id_customization => $customization) {
-                    $product_data = [
-                        'external_id' => (int) $product['product_id'],
-                        'name' => (string) $product['product_name'],
-                        'reference' => (string) $this->getProductReference($product),
-                        'quantity' => (int) $productCustomization['quantity'],
-                        'price' => (float) $product['product_price'],
-                        'purchase_price' => isset($product['original_wholesale_price']) && $product['original_wholesale_price'] > 0 ? 
-                            (float) $product['original_wholesale_price'] : (float) $product['wholesale_price'],
-                        'image_url' => $image_url,
-                        'brand' => (string) Manufacturer::getNameById((int) $product['id_manufacturer']),
-                        'category' => (string) $cat->name,
-                        'supplier' => (string) Supplier::getNameById((int) $product['id_supplier']),
-                        'custom' => $customization
-                    ];
-
-                    if ($stockQuantity !== false) {
-                        $product_data['stock_quantity'] = $stockQuantity;
-                    }
-
-                    if ($ean13 !== false) {
-                        $product_data['ean13'] = $ean13;
-                    }
-
-                    $orderData['products'][$product['id_order_detail'] . '_' . $id_customization] = $product_data;
-                }
-            } else {
-                $product_data = [
-                    'external_id' => (int) $product['product_id'],
-                    'name' => (string) $product['product_name'],
-                    'reference' => (string) $this->getProductReference($product),
-                    'quantity' => $quantity,
-                    'price' => (float) $product['product_price'],
-                    'purchase_price' => isset($product['original_wholesale_price']) && $product['original_wholesale_price'] > 0 ? 
-                        (float) $product['original_wholesale_price'] : (float) $product['wholesale_price'],
-                    'image_url' => $image_url,
-                    'brand' => (string) Manufacturer::getNameById((int) $product['id_manufacturer']),
-                    'category' => (string) $cat->name,
-                    'supplier' => (string) Supplier::getNameById((int) $product['id_supplier']),
-                ];
-
-                if ($stockQuantity !== false) {
-                    $product_data['stock_quantity'] = $stockQuantity;
-                }
-
-                if ($ean13 !== false) {
-                    $product_data['ean13'] = $ean13;
-                }
-
-                $orderData['products'][$product['id_order_detail']] = $product_data;
+            if ($stockQuantity !== false) {
+                $product_data['stock_quantity'] = $stockQuantity;
             }
 
-            $orderData['products'] = array_values($orderData['products']);
-                        
-            if (Tools::strlen($product['ean13']) >= 13) {
-                $product_data['ean13'] = $product['ean13'];
+            if ($ean13 !== false) {
+                $product_data['ean13'] = $ean13;
+            }
+
+            $idCustomization = isset($product['id_customization']) ? (int) $product['id_customization'] : 0;
+            if ($idCustomization > 0 && isset($customizationsByKey[$idCustomization])) {
+                $product_data['custom'] = $customizationsByKey[$idCustomization];
+            }
+
+            $orderData['products'][$product['id_order_detail']] = $product_data;
+        }
+
+        $orderData['products'] = array_values($orderData['products']);
+
+        return $orderData;
+    }
+
+    /**
+     * Get shipping information for Dropday API
+     * 
+     * @param Order $order
+     * @param Cart $cart
+     * @return array
+     */
+    private function getShippingInfo(Order $order, Cart $cart)
+    {
+        $shippingInfo = [
+            'name' => '',
+            'description' => '',
+            'cost' => (float) $cart->getTotalShippingCost(null, true, null),
+            'note' => '',
+            'delivery_date' => ''
+        ];
+
+        if ($order->id_carrier > 0) {
+            $carrier = new Carrier((int) $order->id_carrier);
+            if (Validate::isLoadedObject($carrier)) {
+                $shippingInfo['name'] = $carrier->name;
+                
+                if (!empty($carrier->delay) && is_array($carrier->delay)) {
+                    $currentLangId = $this->context->language->id;
+                    if (isset($carrier->delay[$currentLangId])) {
+                        $shippingInfo['description'] = $carrier->delay[$currentLangId];
+                    } else {
+                        $shippingInfo['description'] = reset($carrier->delay);
+                    }
+                } elseif (!empty($carrier->delay)) {
+                    $shippingInfo['description'] = $carrier->delay;
+                }
+            }
+        }
+        
+        $orderMessages = Message::getMessagesByOrderId($order->id, false);
+        if (!empty($orderMessages)) {
+            $notes = [];
+            foreach ($orderMessages as $message) {
+                if (!empty($message['message'])) {
+                    $notes[] = $message['message'];
+                }
+            }
+            if (!empty($notes)) {
+                $shippingInfo['note'] = implode('; ', $notes);
             }
         }
 
-        return $orderData;
+        return $shippingInfo;
     }
 
     /**
@@ -571,46 +631,63 @@ class Dropday extends Module
     }
 
     /**
-     * Makes customization field name
+     * Fetches all customization field names and values for a cart in a single query,
+     * grouped by id_customization.
      * 
-     * @param $productCustomization
-     * @return false|string
+     * @param Cart $cart
+     * @param int $id_lang
+     * @return array<int, array<string, string>> Keyed by id_customization
      */
-    private function getProductCustomizationFieldName($productCustomization)
+    private function getCartCustomizations(Cart $cart, $id_lang)
     {
-        $sql = sprintf('SELECT `name` FROM `%scustomization_field_lang` WHERE `id_customization_field`=%s AND `id_lang`=%s AND `id_shop`=%s',
+        $sql = sprintf(
+            'SELECT cd.id_customization, cd.type, cd.`index`, cd.value, cfl.name AS field_name
+            FROM `%scustomized_data` cd
+            INNER JOIN `%scustomization` c ON c.id_customization = cd.id_customization
+            LEFT JOIN `%scustomization_field_lang` cfl 
+                ON cfl.id_customization_field = cd.`index` 
+                AND cfl.id_lang = %d 
+                AND cfl.id_shop = %d
+            WHERE c.id_cart = %d',
             _DB_PREFIX_,
-            (int) $productCustomization['index'], 
-            $this->context->language->id, 
-            $this->context->shop->id
+            _DB_PREFIX_,
+            _DB_PREFIX_,
+            (int) $id_lang,
+            (int) $this->context->shop->id,
+            (int) $cart->id
         );
-        
-        return DB::getInstance()->getValue($sql) ?: false;
-    }
 
-    /**
-     * Makes customization field value
-     * 
-     * @param $productCustomization
-     * @return false|string
-     */
-    private function getProductCustomizationFieldValue($productCustomization)
-    {
-        // compare as (strings) to avoid complications with '0'
-        switch ((string)$productCustomization['type']) {
-            case (string)Product::CUSTOMIZE_TEXTFIELD:
-                $return = $productCustomization['value'];
-                break;
-            case (string)Product::CUSTOMIZE_FILE:
-                $return = sprintf("%s/upload/%s",
-                    rtrim($this->context->link->getPageLink('index'), '/'),
-                    $productCustomization['value']
-                );
-                break;
-            default:
-                $return = false;
+        $rows = DB::getInstance()->executeS($sql);
+        if (!$rows) {
+            return [];
         }
-        
-        return $return;
+
+        $uploadBaseUrl = rtrim($this->context->link->getPageLink('index'), '/') . '/upload/';
+        $result = [];
+        $counters = [];
+
+        foreach ($rows as $row) {
+            $idCustomization = (int) $row['id_customization'];
+            $type = (string) $row['type'];
+
+            if ($type === (string) Product::CUSTOMIZE_TEXTFIELD) {
+                $value = $row['value'];
+            } elseif ($type === (string) Product::CUSTOMIZE_FILE) {
+                $value = $uploadBaseUrl . $row['value'];
+            } else {
+                continue;
+            }
+
+            if (!isset($counters[$idCustomization])) {
+                $counters[$idCustomization] = 1;
+            }
+
+            $name = $row['field_name'] ?: 'value_' . $counters[$idCustomization];
+            $counters[$idCustomization]++;
+
+            $result[$idCustomization][$name] = $value;
+        }
+
+        return $result;
     }
 }
